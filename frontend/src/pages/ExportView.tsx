@@ -3,7 +3,7 @@
  * 按碑刻生成编目卡并支持全库导出、覆盖导入与清空重播种。
  * 消费全部模型；复用 <StatBadge>、<EmptyPanel>、<LossTag>。
  */
-import { useMemo, useRef, useState, type ChangeEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import {
   Alert,
   App as AntdApp,
@@ -23,6 +23,8 @@ import {
   CloudDownloadOutlined,
   CloudUploadOutlined,
   FileTextOutlined,
+  InboxOutlined,
+  RedoOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
 import EmptyPanel from '@/components/common/EmptyPanel';
@@ -34,9 +36,17 @@ import { loadAll } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import { selectRubbings } from '@/stores/rubbingSlice';
 import { selectCompares, selectLosses } from '@/stores/lossSlice';
+import {
+  clearCurrentPackage,
+  loadCurrentPackage,
+  receivePackage,
+  retryFailed,
+  selectCurrentPackage,
+} from '@/stores/verifySlice';
 import { SEAL_TYPE_COLOR, SEAL_TYPE_LABEL, sealPositionWeight, type Seal, type SealType } from '@/types/seal';
 import { RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
 import { COMPARE_CONCLUSION_COLOR, COMPARE_CONCLUSION_LABEL } from '@/types/compare';
+import { STELE_VERIFY_STATUS_COLOR, STELE_VERIFY_STATUS_LABEL } from '@/types/package';
 import {
   DB_NAME,
   DB_SCHEMA_VERSION,
@@ -48,13 +58,16 @@ import {
   writeLastBackupAt,
   type RubbingSnapshot,
 } from '@/utils/db';
+import { buildSamplePackage } from '@/utils/verifyPackage';
 import {
   buildAllCatalogCards,
   buildCatalogCard,
   copyText,
+  download,
   exportCatalogCard,
   exportLossLedgerCsv,
   exportSnapshotJson,
+  stampSuffix,
 } from '@/utils/export';
 
 export default function ExportView() {
@@ -67,9 +80,16 @@ export default function ExportView() {
   const losses = useAppSelector(selectLosses);
   const compares = useAppSelector(selectCompares);
   const sealTable = useIdbTable<Seal>((database) => database.seals, { sortByUpdatedAt: false });
+  const currentPackage = useAppSelector(selectCurrentPackage);
 
   const [steleId, setSteleId] = useState<string>('');
   const [lastBackupAt, setLastBackupAt] = useState<string | null>(readLastBackupAt());
+  const pkgFileRef = useRef<HTMLInputElement>(null);
+
+  // 打开页面即载入上次核验包会话，失败项可直接重试
+  useEffect(() => {
+    void dispatch(loadCurrentPackage());
+  }, [dispatch]);
 
   const activeSteleId = steleId || steles[0]?.id || '';
   const stele = steles.find((item) => item.id === activeSteleId);
@@ -115,6 +135,17 @@ export default function ExportView() {
     }),
     [compares, losses.length, rubbings.length, sealTable.rows.length, steles.length],
   );
+
+  const pkgStat = useMemo(() => {
+    const list = currentPackage?.steles ?? [];
+    return {
+      total: list.length,
+      recognized: list.filter((s) => s.status === 'recognized').length,
+      failed: list.filter((s) => s.status === 'failed').length,
+      pending: list.reduce((sum, s) => sum + s.pendingCompareIds.length, 0),
+      upgraded: currentPackage?.upgradedLossCount ?? 0,
+    };
+  }, [currentPackage]);
 
   const handleExport = async (): Promise<void> => {
     const snapshot = await exportSnapshot();
@@ -163,6 +194,61 @@ export default function ExportView() {
     await resetDatabase();
     await dispatch(loadAll());
     message.success('已清空并重新载入演示数据');
+  };
+
+  const handlePackageFile = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const text = await file.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      message.error('JSON 解析失败，请确认文件格式');
+      return;
+    }
+    const invalid = validateSnapshot(parsed);
+    if (invalid) {
+      message.error(invalid);
+      return;
+    }
+    const record = await dispatch(receivePackage({ fileName: file.name, snapshot: parsed as RubbingSnapshot })).unwrap();
+    await dispatch(loadAll());
+    const failed = record.steles.filter((s) => s.status === 'failed').length;
+    const pending = record.steles.reduce((sum, s) => sum + s.pendingCompareIds.length, 0);
+    if (failed > 0) {
+      message.warning(`收包完成：${record.steles.length - failed} 块已认，${failed} 块核对失败（可重试），${pending} 条结论退回待核`);
+    } else {
+      message.success(`收包完成：${record.steles.length} 块碑刻已认，${pending} 条结论退回待核，补坐标 ${record.upgradedLossCount} 条`);
+    }
+  };
+
+  const handleDownloadSamplePackage = (): void => {
+    const snapshot = buildSamplePackage({
+      steles,
+      rubbings,
+      losses,
+      seals: sealTable.rows,
+      compares,
+    });
+    const filename = `gbrubbing-核验包示例-${stampSuffix()}.json`;
+    download(filename, JSON.stringify(snapshot, null, 2), 'application/json;charset=utf-8');
+    message.success(`已下载 ${filename}，可直接作为核验包接收`);
+  };
+
+  const handleRetryFailed = async (): Promise<void> => {
+    const record = await dispatch(retryFailed()).unwrap();
+    await dispatch(loadAll());
+    if (!record) return;
+    const failed = record.steles.filter((s) => s.status === 'failed').length;
+    if (failed > 0) message.warning(`重试完成：仍有 ${failed} 块核对失败`);
+    else message.success('重试完成：失败项已全部认好');
+  };
+
+  const handleClearPackage = async (): Promise<void> => {
+    await dispatch(clearCurrentPackage());
+    message.success('已清空核验包会话（已认数据保留在库中）');
   };
 
   const sealColumns: ColumnsType<Seal> = [
@@ -329,6 +415,108 @@ export default function ExportView() {
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                   合订文本共 {allCardsLength} 字符，含全部 {steles.length} 处碑刻。
                 </Typography.Text>
+              </>
+            )}
+          </Card>
+
+          <Card
+            title="核验包接收（校勘组回传）"
+            style={{ marginTop: 16 }}
+            extra={
+              <Space wrap>
+                <Button size="small" onClick={handleDownloadSamplePackage}>
+                  下载示例核验包
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<InboxOutlined />}
+                  onClick={() => pkgFileRef.current?.click()}
+                >
+                  接收核验包
+                </Button>
+                <input
+                  ref={pkgFileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  style={{ display: 'none' }}
+                  onChange={(event) => void handlePackageFile(event)}
+                />
+              </Space>
+            }
+          >
+            {currentPackage === null ? (
+              <EmptyPanel
+                title="尚未接收核验包"
+                description="校勘组校完把结果打成核验包（JSON）发回后，在此接收。收包按碑刻逐个核验：编目员填的拓法、纸墨、尺寸与钤印不会被包里的值压掉；结论依据的字位若在本地被动过，会退回待核；核对失败只回滚这一块。"
+                size="small"
+              />
+            ) : (
+              <>
+                <div className="gb-stat-row">
+                  <StatBadge label="已认" value={pkgStat.recognized} suffix="块" tone="success" />
+                  <StatBadge label="核对失败" value={pkgStat.failed} suffix="块" tone="danger" />
+                  <StatBadge label="退回待核结论" value={pkgStat.pending} suffix="条" tone="warning" />
+                  <StatBadge label="补坐标" value={pkgStat.upgraded} suffix="条" tone="info" />
+                </div>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  来源 {currentPackage.fileName} · {new Date(currentPackage.receivedAt).toLocaleString('zh-CN')} ·
+                  共 {pkgStat.total} 块碑刻
+                </Typography.Text>
+                <Table<(typeof currentPackage.steles)[number]>
+                  rowKey="steleId"
+                  size="small"
+                  pagination={false}
+                  style={{ marginTop: 12 }}
+                  dataSource={currentPackage.steles}
+                  columns={[
+                    { title: '碑刻', dataIndex: 'title', width: 140 },
+                    {
+                      title: '核验状态',
+                      dataIndex: 'status',
+                      width: 110,
+                      render: (value: keyof typeof STELE_VERIFY_STATUS_LABEL) => (
+                        <Tag color={STELE_VERIFY_STATUS_COLOR[value]}>{STELE_VERIFY_STATUS_LABEL[value]}</Tag>
+                      ),
+                    },
+                    {
+                      title: '退回待核结论',
+                      dataIndex: 'pendingCompareIds',
+                      width: 120,
+                      render: (ids: string[]) => (ids.length > 0 ? <Tag color="gold">{ids.length} 条</Tag> : '—'),
+                    },
+                    {
+                      title: '失败原因',
+                      dataIndex: 'reason',
+                      render: (value: string) =>
+                        value ? <Typography.Text type="danger">{value}</Typography.Text> : '—',
+                    },
+                    {
+                      title: '核验时间',
+                      dataIndex: 'recognizedAt',
+                      width: 170,
+                      render: (value?: number) => (value ? new Date(value).toLocaleString('zh-CN') : '—'),
+                    },
+                  ]}
+                />
+                <Space wrap style={{ marginTop: 12 }}>
+                  <Button
+                    icon={<RedoOutlined />}
+                    onClick={() => void handleRetryFailed()}
+                    disabled={pkgStat.failed === 0}
+                  >
+                    重试失败项{pkgStat.failed > 0 ? `（${pkgStat.failed}）` : ''}
+                  </Button>
+                  <Popconfirm
+                    title="清空核验包会话"
+                    description="只清空本次收包记录，已认好并写入本地的数据会保留。"
+                    okText="确认清空"
+                    cancelText="取消"
+                    onConfirm={() => void handleClearPackage()}
+                  >
+                    <Button>清空核验记录</Button>
+                  </Popconfirm>
+                </Space>
               </>
             )}
           </Card>

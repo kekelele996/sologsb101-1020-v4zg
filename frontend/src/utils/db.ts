@@ -11,13 +11,14 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import type { VerifyPackageRecord } from '@/types/package';
 import { sortLosses } from './collate';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +86,7 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  packages!: Table<VerifyPackageRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +101,7 @@ class RubbingDatabase extends Dexie {
     });
 
     // v2：Loss 增加 charNo 与 [rubbingId+lineNo+charNo] 复合索引，并按行号顺序重建历史字位记录
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         steles: 'id, title, era, form, location, updatedAt',
         rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
@@ -128,6 +130,11 @@ class RubbingDatabase extends Dexie {
         });
         await table.bulkPut(sortLosses(rebuilt));
       });
+
+    // v3：新增 packages 表存放核验包接收会话（按碑刻逐个核验、失败重试）
+    this.version(DB_SCHEMA_VERSION).stores({
+      packages: 'id, status, receivedAt',
+    });
   }
 }
 
@@ -279,13 +286,14 @@ export function validateSnapshot(input: unknown): string {
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.packages], async () => {
     await Promise.all([
       db.steles.clear(),
       db.rubbings.clear(),
       db.losses.clear(),
       db.seals.clear(),
       db.compares.clear(),
+      db.packages.clear(),
     ]);
   });
 }

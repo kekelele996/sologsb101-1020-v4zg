@@ -1,18 +1,20 @@
 /**
  * Redux store 组装与类型化 hooks
- * 组装 stele / rubbing / loss 三个 reducer，并提供首屏一次性载入 thunk。
+ * 组装 stele / rubbing / loss / verify 四个 reducer，并提供首屏一次性载入 thunk。
  */
 import { configureStore } from '@reduxjs/toolkit';
 import { useDispatch, useSelector, type TypedUseSelectorHook } from 'react-redux';
 import steleReducer, { loadSteles } from './steleSlice';
 import rubbingReducer, { loadRubbings } from './rubbingSlice';
 import lossReducer, { loadLosses } from './lossSlice';
+import verifyReducer from './verifySlice';
 
 export const store = configureStore({
   reducer: {
     stele: steleReducer,
     rubbing: rubbingReducer,
     loss: lossReducer,
+    verify: verifyReducer,
   },
 });
 
