@@ -1,6 +1,7 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录）
+ * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录；
+ *   v2 → v3：新增 packages 表留存院外校勘组核验包，收包按碑刻并账不再整库覆盖）
  * - 五张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
@@ -11,13 +12,14 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
-import { sortLosses } from './collate';
+import type { ReceivedPackage } from '@/types/packageReceive';
+import { backfillLossCharNo } from './collate';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +87,8 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  /** 院外校勘组核验包存档（校勘组侧留存，收包后不删） */
+  packages!: Table<ReceivedPackage, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +103,7 @@ class RubbingDatabase extends Dexie {
     });
 
     // v2：Loss 增加 charNo 与 [rubbingId+lineNo+charNo] 复合索引，并按行号顺序重建历史字位记录
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         steles: 'id, title, era, form, location, updatedAt',
         rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
@@ -110,24 +114,20 @@ class RubbingDatabase extends Dexie {
       .upgrade(async (tx) => {
         const table = tx.table<Loss>('losses');
         const all = await table.toArray();
-        const byRubbing = new Map<string, Loss[]>();
-        all.forEach((loss) => {
-          byRubbing.set(loss.rubbingId, [...(byRubbing.get(loss.rubbingId) ?? []), loss]);
-        });
-        const rebuilt: Loss[] = [];
-        byRubbing.forEach((list) => {
-          // 按行号排序后，为缺失 charNo 的历史记录在行内顺序补位
-          const sorted = [...list].sort((a, b) => a.lineNo - b.lineNo);
-          const counter = new Map<number, number>();
-          sorted.forEach((loss) => {
-            const used = counter.get(loss.lineNo) ?? 0;
-            const charNo = typeof loss.charNo === 'number' && loss.charNo > 0 ? loss.charNo : used + 1;
-            counter.set(loss.lineNo, Math.max(used, charNo));
-            rebuilt.push({ ...loss, charNo, updatedAt: Date.now() });
-          });
-        });
-        await table.bulkPut(sortLosses(rebuilt));
+        // 历史记录按行号顺序补字位，并标记迁移时间
+        const rebuilt = backfillLossCharNo(all).map((loss) => ({ ...loss, updatedAt: Date.now() }));
+        await table.bulkPut(rebuilt);
       });
+
+    // v3：新增 packages 表留存校勘组核验包；业务五表结构不变
+    this.version(DB_SCHEMA_VERSION).stores({
+      steles: 'id, title, era, form, location, updatedAt',
+      rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
+      losses: 'id, rubbingId, lineNo, charNo, [rubbingId+lineNo+charNo], type, severity, updatedAt',
+      seals: 'id, rubbingId, sealType, position, updatedAt',
+      compares: 'id, steleId, rubbingIdA, rubbingIdB, conclusion, date, updatedAt',
+      packages: 'id, status, receivedAt',
+    });
   }
 }
 

@@ -6,6 +6,9 @@
 /** 断代结论：早本 / 晚本 / 同版 / 待考 */
 export type CompareConclusion = 'early' | 'late' | 'same' | 'pending';
 
+/** 核验状态：已核验 / 退回待核（收包时发现依据字位在编目台后来动过） */
+export type CompareReviewState = 'verified' | 'held';
+
 export interface Compare {
   id: string;
   /** 所属碑刻 id */
@@ -22,6 +25,10 @@ export interface Compare {
   operator: string;
   /** 比对日期 yyyy-MM-dd */
   date: string;
+  /** 核验状态；校勘组回包并账后为 verified / held，历史记录缺省视为 verified */
+  reviewState?: CompareReviewState;
+  /** 退回待核原因（命中的依据字位说明） */
+  holdReason?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -48,6 +55,16 @@ export const COMPARE_CONCLUSION_OPTIONS: ReadonlyArray<{ value: CompareConclusio
   { value: 'same', label: '同版' },
   { value: 'pending', label: '待考' },
 ];
+
+export const COMPARE_REVIEW_STATE_LABEL: Record<CompareReviewState, string> = {
+  verified: '已核验',
+  held: '待核',
+};
+
+export const COMPARE_REVIEW_STATE_COLOR: Record<CompareReviewState, string> = {
+  verified: '#2f6f4f',
+  held: '#b03a2e',
+};
 
 export function createEmptyCompareDraft(steleId: string): CompareDraft {
   return {

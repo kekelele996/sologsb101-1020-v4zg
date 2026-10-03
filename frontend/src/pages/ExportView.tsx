@@ -20,9 +20,12 @@ import {
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
+  AuditOutlined,
   CloudDownloadOutlined,
   CloudUploadOutlined,
+  DeleteOutlined,
   FileTextOutlined,
+  RedoOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
 import EmptyPanel from '@/components/common/EmptyPanel';
@@ -37,6 +40,7 @@ import { selectCompares, selectLosses } from '@/stores/lossSlice';
 import { SEAL_TYPE_COLOR, SEAL_TYPE_LABEL, sealPositionWeight, type Seal, type SealType } from '@/types/seal';
 import { RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
 import { COMPARE_CONCLUSION_COLOR, COMPARE_CONCLUSION_LABEL } from '@/types/compare';
+import type { PackageSteleResult, ReceivedPackage } from '@/types/packageReceive';
 import {
   DB_NAME,
   DB_SCHEMA_VERSION,
@@ -56,6 +60,12 @@ import {
   exportLossLedgerCsv,
   exportSnapshotJson,
 } from '@/utils/export';
+import {
+  receiveVerificationPackage,
+  removeReceivedPackage,
+  retryPackageStele,
+  validateVerificationPackage,
+} from '@/utils/packageReceive';
 
 export default function ExportView() {
   const { message, modal } = AntdApp.useApp();
@@ -67,9 +77,14 @@ export default function ExportView() {
   const losses = useAppSelector(selectLosses);
   const compares = useAppSelector(selectCompares);
   const sealTable = useIdbTable<Seal>((database) => database.seals, { sortByUpdatedAt: false });
+  // 校勘组核验包留档（收包后两边各留一份：业务五表 + packages 留档）
+  const packageTable = useIdbTable<ReceivedPackage>((database) => database.packages, { sortByUpdatedAt: false });
 
   const [steleId, setSteleId] = useState<string>('');
   const [lastBackupAt, setLastBackupAt] = useState<string | null>(readLastBackupAt());
+  const [receiving, setReceiving] = useState(false);
+  const [retryingKey, setRetryingKey] = useState<string>('');
+  const packageFileRef = useRef<HTMLInputElement>(null);
 
   const activeSteleId = steleId || steles[0]?.id || '';
   const stele = steles.find((item) => item.id === activeSteleId);
@@ -111,7 +126,11 @@ export default function ExportView() {
       passPercent:
         compares.length === 0
           ? 0
-          : Math.round((compares.filter((compare) => compare.conclusion !== 'pending').length / compares.length) * 100),
+          : Math.round(
+              (compares.filter((compare) => compare.conclusion !== 'pending' && compare.reviewState !== 'held').length /
+                compares.length) *
+                100,
+            ),
     }),
     [compares, losses.length, rubbings.length, sealTable.rows.length, steles.length],
   );
@@ -147,9 +166,9 @@ export default function ExportView() {
       return;
     }
     modal.confirm({
-      title: '覆盖导入本地数据',
-      content: '导入会清空当前浏览器中的全部碑帖档案，再写入备份内容，操作不可撤销。',
-      okText: '确认导入',
+      title: '整库还原（覆盖）',
+      content: '该操作会清空当前浏览器中的全部碑帖档案，再写入备份内容，仅用于整机恢复；收取校勘核验包请用左侧「收取核验包」（按碑刻并账，不覆盖编目台登记）。',
+      okText: '确认覆盖还原',
       cancelText: '取消',
       onOk: async () => {
         await importSnapshot(parsed as RubbingSnapshot);
@@ -159,11 +178,77 @@ export default function ExportView() {
     });
   };
 
+  const handleReceiveClick = (): void => {
+    packageFileRef.current?.click();
+  };
+
+  /** 收取校勘组核验包：原包留档，按碑刻逐个认，失败只回滚这一块 */
+  const handleReceiveFile = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const text = await file.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      message.error('JSON 解析失败，请确认核验包文件格式');
+      return;
+    }
+    const invalid = validateVerificationPackage(parsed);
+    if (invalid) {
+      message.error(invalid);
+      return;
+    }
+    setReceiving(true);
+    try {
+      const summary = await receiveVerificationPackage(parsed as RubbingSnapshot);
+      await dispatch(loadAll());
+      const parts = [`共 ${summary.steleCount} 块碑刻，认好 ${summary.okCount} 块`];
+      if (summary.failedCount > 0) parts.push(`失败 ${summary.failedCount} 块（仅回滚失败块，可在此处重试）`);
+      if (summary.heldCount > 0) parts.push(`${summary.heldCount} 条断代结论退回待核`);
+      if (summary.backfilledCoordCount > 0) parts.push(`按行号补出坐标 ${summary.backfilledCoordCount} 条`);
+      if (summary.failedCount > 0) message.warning(parts.join('；'));
+      else message.success(`核验包已收取留档：${parts.join('；')}`);
+    } catch (error) {
+      message.error(`收取核验包失败：${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      setReceiving(false);
+    }
+  };
+
+  const handleRetryStele = async (packageId: string, steleIdToRetry: string): Promise<void> => {
+    const key = `${packageId}:${steleIdToRetry}`;
+    setRetryingKey(key);
+    try {
+      const outcome = await retryPackageStele(packageId, steleIdToRetry);
+      await dispatch(loadAll());
+      if (outcome.result.status === 'ok') {
+        const held = outcome.result.heldCompareIds?.length ?? 0;
+        message.success(`「${outcome.result.title}」已认好${held > 0 ? `，${held} 条结论退回待核` : ''}`);
+      } else {
+        message.error(`「${outcome.result.title}」仍核对失败：${outcome.result.error ?? '未知原因'}`);
+      }
+    } finally {
+      setRetryingKey('');
+    }
+  };
+
+  const handleRemovePackage = async (packageId: string): Promise<void> => {
+    await removeReceivedPackage(packageId);
+    message.success('核验包留档已删除（已并账的编目数据保留）');
+  };
+
   const handleReset = async (): Promise<void> => {
     await resetDatabase();
     await dispatch(loadAll());
     message.success('已清空并重新载入演示数据');
   };
+
+  const sortedPackages = useMemo(
+    () => [...packageTable.rows].sort((a, b) => b.receivedAt - a.receivedAt),
+    [packageTable.rows],
+  );
 
   const sealColumns: ColumnsType<Seal> = [
     { title: '位置', dataIndex: 'position', width: 90 },
@@ -210,8 +295,11 @@ export default function ExportView() {
           <Button icon={<CloudDownloadOutlined />} onClick={() => void handleExport()}>
             导出 JSON
           </Button>
+          <Button type="primary" icon={<AuditOutlined />} loading={receiving} onClick={handleReceiveClick}>
+            收取核验包
+          </Button>
           <Button icon={<CloudUploadOutlined />} onClick={handleImportClick}>
-            导入 JSON
+            整库还原导入
           </Button>
           <input
             ref={fileRef}
@@ -219,6 +307,13 @@ export default function ExportView() {
             accept="application/json,.json"
             style={{ display: 'none' }}
             onChange={(event) => void handleImportFile(event)}
+          />
+          <input
+            ref={packageFileRef}
+            type="file"
+            accept="application/json,.json"
+            style={{ display: 'none' }}
+            onChange={(event) => void handleReceiveFile(event)}
           />
           <Popconfirm
             title="清空并重播种"
@@ -242,6 +337,149 @@ export default function ExportView() {
         <StatBadge label="比对记录" value={stat.compares} suffix="条" tone="danger" />
         <StatBadge label="已定断代占比" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
       </div>
+
+      <Row gutter={16}>
+        <Col span={24}>
+          <Card
+            className="gb-table-card"
+            title="院外校勘组核验包"
+            style={{ marginBottom: 16 }}
+            extra={
+              <Space size={4} wrap>
+                <Button size="small" type="primary" icon={<AuditOutlined />} loading={receiving} onClick={handleReceiveClick}>
+                  收取核验包
+                </Button>
+                <input
+                  ref={packageFileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  style={{ display: 'none' }}
+                  onChange={(event) => void handleReceiveFile(event)}
+                />
+              </Space>
+            }
+          >
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="按碑刻逐个认，编目台与校勘组两边各留一份"
+              description="收包不会整库覆盖：编目员登记的拓法、纸墨、尺寸、钤印与新登拓本均保留；断代结论依据的字位若在编目台后来动过，该结论自动退回待核；一块碑刻核对失败只回滚这一块，下次打开只重试失败块。早期旧包只有行号时，按行号顺序补出坐标。"
+            />
+            {sortedPackages.length === 0 ? (
+              <EmptyPanel
+                title="还没有收到核验包"
+                description="校勘组校完发回的核验包（与备份同构的 JSON）点「收取核验包」按碑刻并账，原包在此留档。"
+                size="small"
+              />
+            ) : (
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                {sortedPackages.map((pkg) => {
+                  const okCount = pkg.results.filter((result) => result.status === 'ok').length;
+                  const failedCount = pkg.results.filter((result) => result.status === 'failed').length;
+                  const heldCount = pkg.results.reduce((sum, result) => sum + (result.heldCompareIds?.length ?? 0), 0);
+                  return (
+                    <Card
+                      key={pkg.id}
+                      size="small"
+                      type="inner"
+                      title={
+                        <Space size={8} wrap>
+                          <span>收包于 {new Date(pkg.receivedAt).toLocaleString('zh-CN')}</span>
+                          {pkg.status === 'ok' ? (
+                            <Tag color="green">全部认好</Tag>
+                          ) : (
+                            <Tag color="red">{failedCount} 块失败待重试</Tag>
+                          )}
+                          {heldCount > 0 && <Tag color="orange">{heldCount} 条结论待核</Tag>}
+                          {pkg.backfilledCoordCount > 0 && (
+                            <Tag color="gold">旧包补坐标 {pkg.backfilledCoordCount} 条</Tag>
+                          )}
+                        </Space>
+                      }
+                      extra={
+                        <Space size={4}>
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            包出 {pkg.exportedAt ? new Date(pkg.exportedAt).toLocaleDateString('zh-CN') : '未记'} · {okCount}/{pkg.steleCount} 块认好
+                          </Typography.Text>
+                          <Popconfirm
+                            title="删除该核验包留档"
+                            description="只删除校勘组侧留档，已并账的编目数据不受影响。"
+                            okText="删除"
+                            cancelText="取消"
+                            onConfirm={() => void handleRemovePackage(pkg.id)}
+                          >
+                            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+                              删留档
+                            </Button>
+                          </Popconfirm>
+                        </Space>
+                      }
+                    >
+                      <Table<PackageSteleResult>
+                        rowKey="steleId"
+                        size="small"
+                        pagination={false}
+                        dataSource={pkg.results}
+                        columns={[
+                          { title: '碑刻', dataIndex: 'title', width: 160 },
+                          {
+                            title: '状态',
+                            dataIndex: 'status',
+                            width: 90,
+                            render: (value: PackageSteleResult['status']) =>
+                              value === 'ok' ? <Tag color="green">已认好</Tag> : <Tag color="red">失败</Tag>,
+                          },
+                          {
+                            title: '退回待核',
+                            key: 'held',
+                            width: 120,
+                            render: (_v, record) =>
+                              (record.heldCompareIds?.length ?? 0) > 0 ? (
+                                <Tag color="orange">{record.heldCompareIds?.length} 条结论待核</Tag>
+                              ) : (
+                                <Typography.Text type="secondary">—</Typography.Text>
+                              ),
+                          },
+                          {
+                            title: '说明',
+                            key: 'error',
+                            render: (_v, record) =>
+                              record.error ? (
+                                <Typography.Text type="danger">{record.error}</Typography.Text>
+                              ) : (
+                                <Typography.Text type="secondary">
+                                  {record.attempts > 1 ? `第 ${record.attempts} 次重试认好` : '已并账入库'}
+                                </Typography.Text>
+                              ),
+                          },
+                          {
+                            title: '操作',
+                            key: 'action',
+                            width: 110,
+                            render: (_v, record) =>
+                              record.status === 'failed' ? (
+                                <Button
+                                  size="small"
+                                  type="link"
+                                  icon={<RedoOutlined />}
+                                  loading={retryingKey === `${pkg.id}:${record.steleId}`}
+                                  onClick={() => void handleRetryStele(pkg.id, record.steleId)}
+                                >
+                                  重试此块
+                                </Button>
+                              ) : null,
+                          },
+                        ]}
+                      />
+                    </Card>
+                  );
+                })}
+              </Space>
+            )}
+          </Card>
+        </Col>
+      </Row>
 
       <Row gutter={16}>
         <Col xs={24} xl={14}>
@@ -351,10 +589,10 @@ export default function ExportView() {
             )}
           </Card>
 
-          <Card title="整库导出" style={{ marginTop: 16 }}>
+          <Card title="整库备份与还原" style={{ marginTop: 16 }}>
             <Space direction="vertical" size={10} style={{ width: '100%' }}>
               <Typography.Text type="secondary">
-                导出文件包含 5 张业务表全量数据与结构版本号，可在其他设备通过「导入 JSON」还原。
+                JSON 备份包含 5 张业务表全量数据与结构版本号，用于整机迁移 / 灾难恢复（覆盖还原）；校勘组回包请用页首「收取核验包」按碑刻并账，不会覆盖编目台登记。
               </Typography.Text>
               <Space wrap>
                 <Button icon={<CloudDownloadOutlined />} onClick={() => void handleExport()}>
@@ -411,9 +649,12 @@ export default function ExportView() {
               {compares
                 .filter((compare) => compare.steleId === activeSteleId)
                 .map((compare) => (
-                  <Tag key={compare.id} color={COMPARE_CONCLUSION_COLOR[compare.conclusion]}>
-                    {compare.date} 比对结论：{COMPARE_CONCLUSION_LABEL[compare.conclusion]}（差异 {compare.diffCount} 字）
-                  </Tag>
+                  <Space key={compare.id} size={4}>
+                    <Tag color={COMPARE_CONCLUSION_COLOR[compare.conclusion]}>
+                      {compare.date} 比对结论：{COMPARE_CONCLUSION_LABEL[compare.conclusion]}（差异 {compare.diffCount} 字）
+                    </Tag>
+                    {compare.reviewState === 'held' && <Tag color="red">待核</Tag>}
+                  </Space>
                 ))}
             </Space>
           </Card>

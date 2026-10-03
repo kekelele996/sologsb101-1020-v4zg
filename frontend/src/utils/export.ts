@@ -93,7 +93,7 @@ export function buildCatalogCard(
     lines.push(
       `　${compare.date}　A：第 ${a?.versionNo ?? '?'} 版　B：第 ${b?.versionNo ?? '?'} 版　差异 ${compare.diffCount} 字　结论 ${
         COMPARE_CONCLUSION_LABEL[compare.conclusion]
-      }　操作人 ${compare.operator || '未填'}`,
+      }${compare.reviewState === 'held' ? '（退回待核）' : ''}　操作人 ${compare.operator || '未填'}`,
     );
   });
   return lines.join('\n');

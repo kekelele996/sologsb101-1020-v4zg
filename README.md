@@ -44,7 +44,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 构建工具 | Vite 5 | 开发服务器端口 22820 |
 | 状态管理 | Redux Toolkit 2 + React Redux 9 | `steleSlice` / `rubbingSlice` / `lossSlice` + `store.ts` 类型化 hooks |
 | 路由 | React Router 6（`createBrowserRouter`，history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号与 v1→v2 升级迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装）+ localStorage | 含数据结构版本号、v1→v2（Loss 补 `charNo`）与 v2→v3（新增 `packages` 核验包留档表）升级迁移 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段类型检查 + 打包，运行阶段仅托管静态产物 |
 
 ---
@@ -71,7 +71,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 | `/rubbings` | 拓本登记 | 录入拓法、纸墨、尺寸与收藏号；同碑自动生成版本序号，钤印增删改与批量调整印别，批量改状态 | Rubbing、Seal、Stele |
 | `/losses` | 损泐字位标注台 | 行号 × 字位网格逐格标注，批量改严重程度；选定基准拓本即时高亮差异字位 | Loss、Rubbing |
 | `/compare` | 同碑多版本比对与断代 | 选定 A/B 两拓本，按字位坐标比对损泐集合并排展示差异，推断早本 / 晚本 / 同版 / 待考并落库 | Compare、Loss、Rubbing |
-| `/export` | 编目卡生成与导出 | 按碑刻生成编目卡文本、合订导出、钤印明细、JSON 导入导出、损泐台账 CSV、清空重播种 | 全部模型 |
+| `/export` | 编目卡生成与导出 | 按碑刻生成编目卡文本、合订导出、钤印明细、JSON 备份 / 整库还原、**收取校勘核验包（按碑刻并账留档）**、损泐台账 CSV、清空重播种 | 全部模型 + Package |
 
 `/` 与未匹配路径重定向到 `/steles`。筛选条件写入 URL query（`?kw=&method=&state=` 等），可直接分享带条件的链接。
 
@@ -87,7 +87,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 | Seal 钤印 | `src/types/seal.ts` | `id` `rubbingId` `sealText` `position` `transcription` `sealType`（收藏印/鉴赏印/作者印） | 按位置排序展示，支持批量改印别 |
 | Compare 版本比对 | `src/types/compare.ts` | `id` `steleId` `rubbingIdA` `rubbingIdB` `diffCount` `conclusion`（早本/晚本/同版/待考） `operator` `date` | 选定两拓本即生成差异清单并回写断代结论 |
 
-数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`losses` 表增加 `charNo` 与 `[rubbingId+lineNo+charNo]` 复合索引，并在 Dexie `.upgrade()` 中按行号顺序为历史字位记录重建 `charNo`。
+数据结构版本号 `DB_SCHEMA_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`。v1→v2：`losses` 表增加 `charNo` 与 `[rubbingId+lineNo+charNo]` 复合索引，并在 Dexie `.upgrade()` 中按行号顺序为历史字位记录重建 `charNo`；v2→v3：新增 `packages` 表留存院外校勘组核验包（见第九节）。
 
 ---
 
@@ -97,13 +97,13 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 sologsb101-1020/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # stele.ts rubbing.ts loss.ts seal.ts compare.ts
+│   │   ├── types/                # stele.ts rubbing.ts loss.ts seal.ts compare.ts packageReceive.ts
 │   │   ├── stores/               # steleSlice.ts rubbingSlice.ts lossSlice.ts store.ts
 │   │   ├── components/common/    # LossTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
 │   │   ├── hooks/                # useLossDiff.ts useIdbTable.ts
 │   │   ├── pages/                # SteleList.tsx RubbingList.tsx LossBoard.tsx CompareView.tsx ExportView.tsx
 │   │   ├── router/               # index.tsx
-│   │   ├── utils/                # collate.ts db.ts export.ts
+│   │   ├── utils/                # collate.ts db.ts export.ts packageReceive.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.tsx main.tsx
 │   ├── public/favicon.svg
@@ -123,10 +123,24 @@ sologsb101-1020/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbrubbing`）**：5 张业务表 `steles` / `rubbings` / `losses` / `seals` / `compares`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stele → Rubbing → Loss / Seal，另有 Stele → Compare，固定 id 如 `stele_01`、`rub_0101`、`loss_010101`），播种幂等，保证字位网格与比对台打开即有内容。
+- **IndexedDB（Dexie，数据库名 `gbrubbing`）**：5 张业务表 `steles` / `rubbings` / `losses` / `seals` / `compares` + 1 张核验包留档表 `packages`（v3 新增），由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stele → Rubbing → Loss / Seal，另有 Stele → Compare，固定 id 如 `stele_01`、`rub_0101`、`loss_010101`），播种幂等，保证字位网格与比对台打开即有内容。
 - **localStorage**：仅存元数据 —— `gbrubbing:db-version`（本地结构版本）、`gbrubbing:last-backup-at`（最近导出时间）、`gbrubbing:ui-prefs`（当前碑刻 / 拓本）。
 - **备份**：`/export` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有编目卡 TXT 与损泐台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
+
+---
+
+## 九、院外校勘核验包收包（按碑刻并账，不整库覆盖）
+
+碑帖编目台与院外校勘组各管一段：编目员登记碑刻、拓本、钤印与损泐字位；校勘组校完后把结果导出为核验包（与整库备份同构的 JSON，含 5 张集合）发回。`/export` 页的「收取核验包」执行按碑刻逐个认领并账（`src/utils/packageReceive.ts`），**不再像「整库还原导入」那样清空全库**：
+
+1. **两边各留一份**：原包全量内容存入 IndexedDB 的 `packages` 表留档（校勘组侧），业务五表是编目台侧台账；删除留档不影响已并账数据。
+2. **编目员字段保护**：同 id 拓本已存在时，包里的拓法（`method`）、纸种（`paperType`）、墨色（`inkTone`）、尺寸（`sizeCm`）一律保留编目台的值；钤印同 id 以编目台登记为准，包内没有的本地拓本、钤印原样保留，包内新增记录补入。
+3. **结论退回待核**：收包时对包内每条断代结论，取其 A/B 拓本差异字位（结论依据）；若某依据字位在本地的 `updatedAt` 晚于结论日期当天（说明校勘组出结论后编目台又动过），该条 Compare 置为 `conclusion: 'pending'`、`reviewState: 'held'` 并记录 `holdReason`。比对页可「复核通过」或人工编辑后自动解除待核。
+4. **单碑事务 + 失败隔离**：一块碑刻的全部写入在一个 Dexie 事务内完成；认领校验失败（如同版本序号对应不同拓本 id、同坐标字位 id 冲突）或写库异常时，只回滚这一块，其他碑刻认好的保留。失败块逐块记在留档的 `results` 里，可在导出页「重试此块」；**下次打开应用时自动只重试仍失败的块**。
+5. **旧包升级补坐标**：校勘组早期数据只带行号没有 `charNo`，结构校验放行后，收包归一化阶段按「同一拓本内按行号升序、行内依次补位」的规则补出坐标（与 v1→v2 迁移共用 `backfillLossCharNo()`），补位条数在收包结果中提示。
+
+> 「整库还原导入」仍保留旧的清空覆盖语义，仅用于整机迁移 / 灾难恢复；日常收取校勘回包请用「收取核验包」。
 
 ---
 

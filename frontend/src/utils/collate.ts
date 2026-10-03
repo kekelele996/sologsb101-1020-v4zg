@@ -186,3 +186,38 @@ export function maxCharNo(losses: Loss[]): number {
 export function versionLabel(versionNo: number): string {
   return `第 ${versionNo} 版`
 }
+
+/**
+ * 为只带行号、缺字位（charNo 非正数）的历史损泐记录按行号顺序补坐标：
+ * 同一拓本内按行号升序排列，逐行为缺坐标的记录在行内依次补位。
+ * 已有合法 charNo 的记录保留原值，补位时跳过已被占用的字位。
+ * 返回补齐后的数组（按拓本/行号/字位排序）；不修改入参。
+ */
+export function backfillLossCharNo(losses: Loss[]): Loss[] {
+  const byRubbing = new Map<string, Loss[]>();
+  losses.forEach((loss) => {
+    byRubbing.set(loss.rubbingId, [...(byRubbing.get(loss.rubbingId) ?? []), loss]);
+  });
+  const rebuilt: Loss[] = [];
+  byRubbing.forEach((list) => {
+    const sorted = [...list].sort((a, b) => a.lineNo - b.lineNo);
+    const counter = new Map<number, number>();
+    sorted.forEach((loss) => {
+      if (typeof loss.charNo === 'number' && loss.charNo > 0) {
+        const used = counter.get(loss.lineNo) ?? 0;
+        counter.set(loss.lineNo, Math.max(used, loss.charNo));
+        rebuilt.push(loss);
+        return;
+      }
+      const next = (counter.get(loss.lineNo) ?? 0) + 1;
+      counter.set(loss.lineNo, next);
+      rebuilt.push({ ...loss, charNo: next });
+    });
+  });
+  return sortLosses(rebuilt);
+}
+
+/** 统计缺坐标的字位记录条数（charNo 非正数，校勘组早期数据） */
+export function countMissingCharNo(losses: Loss[]): number {
+  return losses.filter((loss) => typeof loss.charNo !== 'number' || loss.charNo <= 0).length;
+}

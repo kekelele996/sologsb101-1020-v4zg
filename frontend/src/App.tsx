@@ -19,6 +19,7 @@ import { selectSteles } from './stores/steleSlice';
 import { selectRubbings } from './stores/rubbingSlice';
 import { selectLosses } from './stores/lossSlice';
 import { initDatabase } from './utils/db';
+import { retryFailedPackages } from './utils/packageReceive';
 import { STELE_FORM_LABEL } from './types/stele';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -39,6 +40,16 @@ export default function App() {
     void (async () => {
       try {
         await initDatabase();
+        if (cancelled) return;
+        // 收包后有核对失败的碑刻：下次打开只重试失败的那几块，认好的不重复处理
+        try {
+          const outcome = await retryFailedPackages();
+          if (!cancelled && outcome.retriedSteles > 0 && outcome.recovered > 0) {
+            message.success(`上次核验失败的碑刻已自动重试：${outcome.recovered} 块认好${outcome.stillFailed > 0 ? `，${outcome.stillFailed} 块仍失败` : ''}`);
+          }
+        } catch {
+          /* 留档重试不阻塞首屏，失败块仍可在导出页手动重试 */
+        }
         if (cancelled) return;
         await dispatch(loadAll());
       } catch (error) {

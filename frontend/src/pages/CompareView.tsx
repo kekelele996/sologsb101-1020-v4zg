@@ -19,6 +19,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
@@ -46,6 +47,8 @@ import {
   COMPARE_CONCLUSION_COLOR,
   COMPARE_CONCLUSION_LABEL,
   COMPARE_CONCLUSION_OPTIONS,
+  COMPARE_REVIEW_STATE_COLOR,
+  COMPARE_REVIEW_STATE_LABEL,
   createEmptyCompareDraft,
   type Compare,
   type CompareConclusion,
@@ -175,13 +178,22 @@ export default function CompareView() {
   const submit = async (): Promise<void> => {
     const values = await form.validateFields();
     if (editing) {
-      await dispatch(updateCompare({ id: editing.id, patch: values })).unwrap();
-      message.success('已更新比对记录');
+      // 人工复核后保存：取消待核挂起，按编辑结果落库
+      await dispatch(
+        updateCompare({ id: editing.id, patch: { ...values, reviewState: 'verified', holdReason: '' } }),
+      ).unwrap();
+      message.success('已更新比对记录，待核状态已解除');
     } else {
       await dispatch(saveCompare(values)).unwrap();
       message.success(`已保存比对记录：差异 ${values.diffCount} 字，结论「${COMPARE_CONCLUSION_LABEL[values.conclusion]}」`);
     }
     setOpen(false);
+  };
+
+  /** 对退回待核的结论直接复核通过（不改结论，只解除待核） */
+  const approveHeld = async (record: Compare): Promise<void> => {
+    await dispatch(updateCompare({ id: record.id, patch: { reviewState: 'verified', holdReason: '' } })).unwrap();
+    message.success(`「${COMPARE_CONCLUSION_LABEL[record.conclusion]}」结论已复核通过`);
   };
 
   const columns: ColumnsType<Compare> = [
@@ -202,21 +214,41 @@ export default function CompareView() {
     {
       title: '断代结论',
       dataIndex: 'conclusion',
-      width: 110,
-      render: (value: CompareConclusion) => (
-        <Tag color={COMPARE_CONCLUSION_COLOR[value]}>{COMPARE_CONCLUSION_LABEL[value]}</Tag>
+      width: 130,
+      render: (value: CompareConclusion, record) => (
+        <Space size={4} direction="vertical" style={{ rowGap: 2 }}>
+          <Tag color={COMPARE_CONCLUSION_COLOR[value]}>{COMPARE_CONCLUSION_LABEL[value]}</Tag>
+          {record.reviewState === 'held' && (
+            <Tooltip title={record.holdReason || '结论依据的字位后来动过'}>
+              <Tag color={COMPARE_REVIEW_STATE_COLOR.held} style={{ marginInlineEnd: 0 }}>
+                {COMPARE_REVIEW_STATE_LABEL.held}
+              </Tag>
+            </Tooltip>
+          )}
+        </Space>
       ),
     },
     { title: '操作人', dataIndex: 'operator', width: 110, render: (value: string) => value || '未填' },
     {
       title: '操作',
       key: 'action',
-      width: 150,
+      width: 210,
       render: (_value, record) => (
         <Space size={4}>
           <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
             编辑
           </Button>
+          {record.reviewState === 'held' && (
+            <Popconfirm
+              title="复核通过该结论？"
+              description={record.holdReason || '确认字位改动不影响断代结论后再通过。'}
+              okText="复核通过"
+              cancelText="取消"
+              onConfirm={() => void approveHeld(record)}
+            >
+              <Button size="small" type="link">复核通过</Button>
+            </Popconfirm>
+          )}
           <Popconfirm
             title="删除该比对记录"
             okText="确认"
